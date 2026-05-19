@@ -70,7 +70,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 
-from wm_decoder import StandaloneDecoder
+from wm_decoder import StandaloneDecoder, SplitChannelDecoder
 
 
 # =================================================================
@@ -79,28 +79,26 @@ from wm_decoder import StandaloneDecoder
 
 def load_decoder_from_checkpoint(
         ckpt_path: Path,
-        n_bits: int = 32,
+        n_bits: int = 64,
         in_channels: int = 3,
         arch: str = "resnet34",
         device: torch.device = torch.device("cpu"),
-) -> StandaloneDecoder:
-    """Load a StandaloneDecoder from a checkpoint produced by the multi-bit trainer.
+):
+    """Load a watermark decoder from a checkpoint produced by the multi-bit trainer.
 
-    Handles two checkpoint formats:
-      A) Full system checkpoint (wm_system_eXXX.pth) — extracts 'wm_decoder' key.
-      B) Standalone decoder checkpoint (decoder_eXXX.pth) — uses entire state dict.
-
-    Strips DataParallel 'module.' prefix automatically.
+    Auto-detects single-channel vs split-channel mode by inspecting the
+    checkpoint's 'wm_use_split' field and presence of 'bit_head_lat' /
+    'bit_head_skip' keys in the saved decoder state.
 
     Args:
         ckpt_path: path to .pth file on disk.
-        n_bits: number of watermark bits the decoder was trained for.
+        n_bits: number of watermark bits (overridden by checkpoint if saved).
         in_channels: 1 (grayscale) or 3 (color). For multi-bit trainer this is 3.
         arch: backbone architecture (must match training: 'resnet34' default).
         device: target device.
 
     Returns:
-        StandaloneDecoder in eval mode, weights loaded, on the requested device.
+        StandaloneDecoder or SplitChannelDecoder in eval mode, weights loaded.
 
     Raises:
         FileNotFoundError: if checkpoint file is missing.
@@ -115,13 +113,20 @@ def load_decoder_from_checkpoint(
     # Determine where the decoder state lives in the checkpoint
     decoder_state = None
     saved_n_bits = None
+    saved_use_split = False
+    saved_n_bits_lat = None
+    saved_n_bits_skip = None
 
     if isinstance(ckpt, dict):
         # Format A: full system checkpoint
         if "wm_decoder" in ckpt:
             decoder_state = ckpt["wm_decoder"]
             saved_n_bits = ckpt.get("wm_n_bits", None)
-            print(f"[LOAD] format=system_checkpoint key=wm_decoder")
+            saved_use_split = bool(ckpt.get("wm_use_split", False))
+            saved_n_bits_lat = ckpt.get("wm_n_bits_lat", None)
+            saved_n_bits_skip = ckpt.get("wm_n_bits_skip", None)
+            print(f"[LOAD] format=system_checkpoint key=wm_decoder "
+                  f"split={saved_use_split}")
         # Format B: standalone decoder checkpoint
         elif "state_dict" in ckpt and any(
                 k.startswith(("backbone", "bit_head", "detect_head"))
@@ -130,26 +135,18 @@ def load_decoder_from_checkpoint(
             decoder_state = ckpt["state_dict"]
             saved_n_bits = ckpt.get("n_bits", None)
             print(f"[LOAD] format=standalone_decoder")
-        # Format C: raw state dict (decoder keys at top level)
         elif any(k.startswith(("backbone", "bit_head")) for k in ckpt.keys()):
             decoder_state = ckpt
             print(f"[LOAD] format=raw_state_dict")
         else:
             raise KeyError(
-                f"Checkpoint has no 'wm_decoder' key and doesn't look like a "
-                f"standalone decoder state. Top-level keys: {list(ckpt.keys())[:20]}"
+                f"Checkpoint has no 'wm_decoder' key. "
+                f"Top-level keys: {list(ckpt.keys())[:20]}"
             )
     else:
-        # Direct tensor dict
         decoder_state = ckpt
 
-    # Use bit count from checkpoint if available — overrides --n_bits CLI arg
-    if saved_n_bits is not None and saved_n_bits != n_bits:
-        print(f"[LOAD] checkpoint declares n_bits={saved_n_bits}, "
-              f"overriding CLI value {n_bits}")
-        n_bits = int(saved_n_bits)
-
-    # Strip DataParallel 'module.' prefix if present
+    # Strip DataParallel 'module.' prefix
     cleaned = {}
     for k, v in decoder_state.items():
         if not isinstance(v, torch.Tensor):
@@ -160,13 +157,40 @@ def load_decoder_from_checkpoint(
                 k_clean = k_clean[len(prefix):]
         cleaned[k_clean] = v
 
-    # Build the decoder with matching config
-    decoder = StandaloneDecoder(
-        n_bits=n_bits,
-        in_channels=in_channels,
-        arch=arch,
-        hidden_dim=256,
-    )
+    # Auto-detect split mode from state dict keys if not declared
+    has_split_heads = any(k.startswith(("bit_head_lat", "bit_head_skip"))
+                          for k in cleaned.keys())
+    if has_split_heads and not saved_use_split:
+        print(f"[LOAD] detected split-channel state in checkpoint")
+        saved_use_split = True
+
+    # Build the right decoder
+    if saved_use_split:
+        n_lat = int(saved_n_bits_lat) if saved_n_bits_lat else n_bits // 2
+        n_skip = int(saved_n_bits_skip) if saved_n_bits_skip else n_bits - n_lat
+        decoder = SplitChannelDecoder(
+            n_bits_lat=n_lat,
+            n_bits_skip=n_skip,
+            in_channels=in_channels,
+            arch=arch,
+            hidden_dim=256,
+        )
+        effective_n_bits = n_lat + n_skip
+        print(f"[LOAD] using SplitChannelDecoder lat={n_lat} skip={n_skip} "
+              f"total={effective_n_bits}")
+    else:
+        if saved_n_bits is not None and saved_n_bits != n_bits:
+            print(f"[LOAD] checkpoint declares n_bits={saved_n_bits}, "
+                  f"overriding CLI value {n_bits}")
+            n_bits = int(saved_n_bits)
+        decoder = StandaloneDecoder(
+            n_bits=n_bits,
+            in_channels=in_channels,
+            arch=arch,
+            hidden_dim=256,
+        )
+        effective_n_bits = n_bits
+        print(f"[LOAD] using StandaloneDecoder n_bits={n_bits}")
 
     result = decoder.load_state_dict(cleaned, strict=False)
     if result.missing_keys:
@@ -176,7 +200,8 @@ def load_decoder_from_checkpoint(
         print(f"[LOAD] WARNING: {len(result.unexpected_keys)} unexpected keys "
               f"(first 5: {result.unexpected_keys[:5]})")
     n_loaded = len(cleaned) - len(result.unexpected_keys)
-    print(f"[LOAD] OK — {n_loaded} parameter tensors loaded, n_bits={n_bits}")
+    print(f"[LOAD] OK — {n_loaded} parameter tensors loaded, "
+          f"effective_n_bits={effective_n_bits}")
 
     decoder = decoder.to(device).eval()
     return decoder
@@ -359,7 +384,7 @@ def main():
     )
     ap.add_argument("--decoder_ckpt", required=True, type=Path,
                     help="Path to system checkpoint (.pth) containing decoder weights")
-    ap.add_argument("--n_bits", type=int, default=32,
+    ap.add_argument("--n_bits", type=int, default=64,
                     help="Number of watermark bits (overridden by checkpoint if saved)")
     ap.add_argument("--arch", type=str, default="resnet34",
                     choices=["resnet18", "resnet34"],

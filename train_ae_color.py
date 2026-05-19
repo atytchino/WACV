@@ -383,6 +383,20 @@ def main():
 
     best_metric = -float("inf")  # we'll track val_ssim_y (higher = better)
 
+    # ── LR warmup schedule ──
+    # Linearly ramp LR from 0 to args.lr over the first WARMUP_STEPS optimizer
+    # steps. Prevents early-training explosions on high-contrast datasets
+    # (e.g. TLD leaves with sharp disease spots) where initial random weights
+    # produce large activations that AMP fp16 can overflow on.
+    WARMUP_STEPS = 200
+    target_lr = float(args.lr)
+
+    def _set_lr(opt, lr_val: float) -> None:
+        for pg in opt.param_groups:
+            pg["lr"] = lr_val
+
+    n_nan_skips_total = 0  # diagnostic counter for steps skipped due to NaN/Inf
+
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         model.train()
@@ -390,28 +404,106 @@ def main():
         running_loss = 0.0
         running_n = 0
         global_step = 0
+        n_nan_skips_epoch = 0
 
         for xb, _ in train_loader:
             global_step += 1
+            # Determine the overall optimizer step index across all epochs so
+            # warmup ramps continuously even if epoch 1 ends mid-warmup.
+            overall_step = (epoch - 1) * len(train_loader) + global_step
+
+            # LR warmup: linear from 0 to target_lr over WARMUP_STEPS
+            if overall_step <= WARMUP_STEPS:
+                warmup_lr = target_lr * (overall_step / max(1, WARMUP_STEPS))
+                _set_lr(optimizer, warmup_lr)
+            elif overall_step == WARMUP_STEPS + 1:
+                _set_lr(optimizer, target_lr)
+                print(f"[LR] warmup complete at step {overall_step}, "
+                      f"lr set to {target_lr:.2e}")
+
             xb = xb.to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type="cuda", enabled=(args.amp and device.type == "cuda")):
-                recon = model(xb).clamp(0, 1)
-                L_l1 = (recon - xb).abs().mean()
-                L_ssim = 1.0 - ssim_y(recon, xb)
-                L_chroma = chroma_loss(recon, xb)
+                # IMPORTANT: do NOT clamp during training — clamp blocks
+                # gradients in saturated regions (output exactly 0 or 1)
+                # which is catastrophic when many pixels saturate on a
+                # poorly-initialized model. Use raw output for loss compute.
+                # The UniversalAutoEncoder's forward_plain already does a
+                # final clamp internally for visualization, but loss uses raw.
+                recon = model(xb)
+                # Soft saturation guard — only clamp for loss compute if recon
+                # has wandered outside a reasonable range. Use the wider
+                # [-0.1, 1.1] window so gradients still flow at boundaries.
+                recon_for_loss = recon.clamp(-0.1, 1.1)
+                L_l1 = (recon_for_loss - xb).abs().mean()
+                L_ssim = 1.0 - ssim_y(recon_for_loss.clamp(0, 1), xb)
+                L_chroma = chroma_loss(recon_for_loss.clamp(0, 1), xb)
                 loss = (
                         args.l1_lam * L_l1
                         + args.ssim_lam * L_ssim
                         + args.chroma_lam * L_chroma
                 )
 
+            # NaN / Inf guard — skip the step rather than poison optimizer state
+            if not torch.isfinite(loss):
+                n_nan_skips_epoch += 1
+                n_nan_skips_total += 1
+                if n_nan_skips_total <= 5 or (n_nan_skips_total % 20 == 0):
+                    print(f"[E{epoch:02d} step {global_step:05d}] "
+                          f"WARN: non-finite loss ({loss.item()}), skipping step. "
+                          f"L1={L_l1.item()} 1-SSIM={L_ssim.item()} "
+                          f"chroma={L_chroma.item()}")
+                # Clear any stale grads from previous backward
+                optimizer.zero_grad(set_to_none=True)
+                # If too many NaN skips in a row, the model is broken — abort.
+                if n_nan_skips_total > 50:
+                    print(f"[FATAL] {n_nan_skips_total} consecutive NaN losses — "
+                          f"aborting. Likely causes: LR too high, AMP overflow "
+                          f"on high-contrast batches, or dataset has corrupt images.")
+                    return
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Pre-step weight check: are any gradients non-finite?
+            # If yes, skip the step entirely — better than poisoning weights.
+            grads_ok = True
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grads_ok = False
+                    break
+            if not grads_ok:
+                n_nan_skips_epoch += 1
+                n_nan_skips_total += 1
+                if n_nan_skips_total <= 5 or (n_nan_skips_total % 20 == 0):
+                    print(f"[E{epoch:02d} step {global_step:05d}] "
+                          f"WARN: non-finite gradient — skipping optimizer step.")
+                optimizer.zero_grad(set_to_none=True)
+                # scaler.update() with skipped step shrinks scale, allowing recovery
+                scaler.update()
+                if n_nan_skips_total > 50:
+                    print(f"[FATAL] {n_nan_skips_total} non-finite gradient skips — aborting.")
+                    return
+                continue
+            # Tighter gradient clipping — was 1.0, reduce to 0.5 for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(optimizer)
             scaler.update()
+
+            # Post-step weight check: did optimizer.step poison weights with NaN?
+            # If yes, abort cleanly so user knows to restart with --no-amp.
+            weights_ok = True
+            for p in model.parameters():
+                if not torch.isfinite(p).all():
+                    weights_ok = False
+                    break
+            if not weights_ok:
+                print(f"[FATAL] Weights contain NaN/Inf after optimizer step at "
+                      f"epoch {epoch}, step {global_step}.")
+                print(f"[FATAL] This is unrecoverable — the model is poisoned.")
+                print(f"[FATAL] Restart with --no-amp and/or --lr 1e-4 for stability.")
+                return
 
             running_loss += float(loss.item()) * xb.size(0)
             running_n += xb.size(0)
@@ -426,9 +518,12 @@ def main():
         val_stats = evaluate(model, val_loader, device)
         dt = time.time() - t0
 
+        nan_note = ""
+        if n_nan_skips_epoch > 0:
+            nan_note = f" | nan_skips={n_nan_skips_epoch}"
         print(f"[E{epoch:02d}] TRAIN loss={train_loss:.4f} | "
               f"VAL L1={val_stats['l1']:.4f} PSNR_y={val_stats['psnr_y']:.2f}dB "
-              f"SSIM_y={val_stats['ssim_y']:.4f} | time={dt:.1f}s")
+              f"SSIM_y={val_stats['ssim_y']:.4f} | time={dt:.1f}s{nan_note}")
 
         meta = {
             "dataset_train": str(train_root),

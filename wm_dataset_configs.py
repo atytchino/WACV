@@ -53,6 +53,14 @@ class DatasetConfig:
     decoder_loss_weight: float = 1.0   # weight of L_decoder in total loss
     decoder_warmup_epochs: int = 1     # epochs before decoder loss kicks in
 
+    # Option B: split-channel encoding (set use_split_channels=True to enable)
+    # Total payload = decoder_n_bits_lat + decoder_n_bits_skip.
+    # If use_split_channels=False (default), the single-channel decoder is used
+    # with decoder_n_bits as the total bit count.
+    use_split_channels: bool = False
+    decoder_n_bits_lat: int = 0        # bits encoded in latent path
+    decoder_n_bits_skip: int = 0       # bits encoded in skip64 path
+
 
 # =================================================================
 # Concrete configurations
@@ -68,8 +76,8 @@ DATASETS: Dict[str, DatasetConfig] = {
         default_batch_size=16,
         default_num_workers=2,
         decoder_arch='resnet34',
-        decoder_n_bits=32,
-        msg_embed_dim=256,
+        decoder_n_bits=64,            # SoTA-comparable payload (HiDDeN: 30-64)
+        msg_embed_dim=256,            # smaller embed for low-texture grayscale
         notes="Original grayscale 3D-printing dataset. Featureless, small images.",
         gate_strength=2.10,
         ssim_lam=0.60,
@@ -87,8 +95,8 @@ DATASETS: Dict[str, DatasetConfig] = {
         default_batch_size=4,         # small due to 512x512 memory footprint
         default_num_workers=4,
         decoder_arch='resnet34',
-        decoder_n_bits=32,
-        msg_embed_dim=256,
+        decoder_n_bits=64,            # SoTA-comparable payload
+        msg_embed_dim=384,            # larger embed — color textures support more signal
         notes="AFHQ animal faces (cat/dog/wild). Native 512x512 RGB JPG.",
         gate_strength=2.10,
         ssim_lam=0.80,                # tighter visual quality target on color
@@ -106,8 +114,8 @@ DATASETS: Dict[str, DatasetConfig] = {
         default_batch_size=4,
         default_num_workers=4,
         decoder_arch='resnet34',
-        decoder_n_bits=32,
-        msg_embed_dim=256,
+        decoder_n_bits=64,            # SoTA-comparable payload
+        msg_embed_dim=384,            # larger embed for color leaf textures
         notes="Tomato Leaf Disease (TLD). Native 512x512 RGB JPG.",
         gate_strength=2.10,
         ssim_lam=0.80,

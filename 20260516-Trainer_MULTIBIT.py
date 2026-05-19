@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # ── Multi-bit watermarking modules (WACV 2026 paper revision) ──
-from wm_decoder import StandaloneDecoder, decoder_loss, warm_start_from_c1
+from wm_decoder import StandaloneDecoder, SplitChannelDecoder, decoder_loss, split_decoder_loss, warm_start_from_c1
 from wm_message import (
     MessageEmbedding,
     ConditionedResidualBranch,
@@ -1121,12 +1121,16 @@ class TrainConfig:
     pub_collage_enable: bool = True
     # Multi-bit watermarking config (WACV 2026 revision)
     dataset_key: str = 'ornl_grayscale'
-    n_bits: int = 32
+    n_bits: int = 64
     msg_embed_dim: int = 256
     decoder_loss_weight: float = 1.0
     decoder_warmup_epochs: int = 1
     decoder_warmstart_from_c1: str = ''  # path to C1 ckpt; empty = no warm-start
     wm_export_sample_every: int = 10  # save 1 of N watermarked images
+    # Option B: split-channel encoding (layered watermarking)
+    use_split_channels: bool = False  # True = 64/64 split, False = redundant single channel
+    n_bits_lat: int = 0   # bits assigned to latent path (0 = read from dataset config or default n_bits//2)
+    n_bits_skip: int = 0  # bits assigned to skip64 path (0 = read from dataset config or default n_bits-lat)
     pub_collage_per_class: int = 10
     pub_collage_keep_train_debug: bool = False
 
@@ -1487,23 +1491,60 @@ class WatermarkTrainer:
         _msg_dim = int(getattr(cfg, 'msg_embed_dim', self._wm_dataset_cfg.msg_embed_dim))
         _in_ch = int(self._wm_dataset_cfg.in_channels)
         _dec_arch = str(self._wm_dataset_cfg.decoder_arch)
-        self._wm_n_bits = _n_bits
 
-        # Message embedding (bits -> feature)
-        self.msg_embed = MessageEmbedding(
-            n_bits=_n_bits, embed_dim=_msg_dim, hidden_dim=128
-        ).to(self.device)
-        # Conditioned residual branches (parallel to g_lat / g_64)
-        self.cond_lat = ConditionedResidualBranch(
-            in_ch=1024, msg_dim=_msg_dim, mid=32
-        ).to(self.device)
-        self.cond_64 = ConditionedResidualBranch(
-            in_ch=512, msg_dim=_msg_dim, mid=32
-        ).to(self.device)
-        # Standalone decoder (works on watermarked RGB image)
-        self.wm_decoder = StandaloneDecoder(
-            n_bits=_n_bits, in_channels=_in_ch, arch=_dec_arch, hidden_dim=256
-        ).to(self.device)
+        # ── Determine encoding mode: single channel or split (Option B) ──
+        # CLI can force split via --use_split_channels; otherwise inherits from dataset config.
+        _use_split = bool(getattr(cfg, 'use_split_channels', self._wm_dataset_cfg.use_split_channels))
+        if _use_split:
+            _n_bits_lat = int(getattr(cfg, 'n_bits_lat', 0) or self._wm_dataset_cfg.decoder_n_bits_lat or (_n_bits // 2))
+            _n_bits_skip = int(getattr(cfg, 'n_bits_skip', 0) or self._wm_dataset_cfg.decoder_n_bits_skip or (_n_bits - _n_bits_lat))
+            _n_bits = _n_bits_lat + _n_bits_skip  # override total
+        else:
+            _n_bits_lat = _n_bits
+            _n_bits_skip = 0
+        self._wm_n_bits = _n_bits
+        self._wm_n_bits_lat = _n_bits_lat
+        self._wm_n_bits_skip = _n_bits_skip
+        self._wm_use_split = _use_split
+
+        if _use_split:
+            # ── Split-channel mode: two MessageEmbeddings + SplitChannelDecoder ──
+            self.msg_embed_lat = MessageEmbedding(
+                n_bits=_n_bits_lat, embed_dim=_msg_dim, hidden_dim=128
+            ).to(self.device)
+            self.msg_embed_skip = MessageEmbedding(
+                n_bits=_n_bits_skip, embed_dim=_msg_dim, hidden_dim=128
+            ).to(self.device)
+            # Alias for code paths that reference self.msg_embed generically
+            self.msg_embed = self.msg_embed_lat
+            self.cond_lat = ConditionedResidualBranch(
+                in_ch=1024, msg_dim=_msg_dim, mid=32
+            ).to(self.device)
+            self.cond_64 = ConditionedResidualBranch(
+                in_ch=512, msg_dim=_msg_dim, mid=32
+            ).to(self.device)
+            self.wm_decoder = SplitChannelDecoder(
+                n_bits_lat=_n_bits_lat, n_bits_skip=_n_bits_skip,
+                in_channels=_in_ch, arch=_dec_arch, hidden_dim=256
+            ).to(self.device)
+        else:
+            # ── Single-channel mode: original 64-bit redundant encoding ──
+            self.msg_embed = MessageEmbedding(
+                n_bits=_n_bits, embed_dim=_msg_dim, hidden_dim=128
+            ).to(self.device)
+            # Alias: in single mode both halves point to the same module
+            self.msg_embed_lat = self.msg_embed
+            self.msg_embed_skip = self.msg_embed
+            self.cond_lat = ConditionedResidualBranch(
+                in_ch=1024, msg_dim=_msg_dim, mid=32
+            ).to(self.device)
+            self.cond_64 = ConditionedResidualBranch(
+                in_ch=512, msg_dim=_msg_dim, mid=32
+            ).to(self.device)
+            self.wm_decoder = StandaloneDecoder(
+                n_bits=_n_bits, in_channels=_in_ch, arch=_dec_arch, hidden_dim=256
+            ).to(self.device)
+
         # Optional warm-start: initialize decoder backbone from pre-trained C1
         _ws_c1 = str(getattr(cfg, 'decoder_warmstart_from_c1', '') or '').strip()
         if _ws_c1:
@@ -1511,8 +1552,10 @@ class WatermarkTrainer:
                 warm_start_from_c1(self.wm_decoder, _ws_c1, verbose=True)
             except Exception as _e:
                 print(f'[WM] decoder warm-start failed: {_e}')
+        _mode_label = 'split' if _use_split else 'single'
         print(
-            f'[WM-MULTIBIT] dataset={_dataset_key} n_bits={_n_bits} '
+            f'[WM-MULTIBIT] dataset={_dataset_key} mode={_mode_label} '
+            f'n_bits={_n_bits} (lat={_n_bits_lat}, skip={_n_bits_skip}) '
             f'msg_dim={_msg_dim} decoder_arch={_dec_arch} in_ch={_in_ch}'
         )
 
@@ -1621,13 +1664,25 @@ class WatermarkTrainer:
                     print(f'[OPT] torch.compile ({_cmode}): {_compiled}')
 
         # optimizers
+        # In split mode msg_embed_lat and msg_embed_skip are distinct modules;
+        # in single mode they alias self.msg_embed. Use a deduped list to avoid
+        # registering the same parameters twice in the optimizer.
+        _msg_modules = []
+        _seen_ids = set()
+        for _m in (self.msg_embed, getattr(self, 'msg_embed_lat', None), getattr(self, 'msg_embed_skip', None)):
+            if _m is not None and id(unwrap(_m)) not in _seen_ids:
+                _seen_ids.add(id(unwrap(_m)))
+                _msg_modules.append(_m)
+        _msg_params = []
+        for _m in _msg_modules:
+            _msg_params.extend(list(unwrap(_m).parameters()))
         g_params = (
             list(unwrap(self.mask_lat).parameters())
             + list(unwrap(self.mask_64).parameters())
             + list(unwrap(self.g_lat).parameters())
             + list(unwrap(self.g_64).parameters())
             + list(unwrap(self.freq_ctrl).parameters())
-            + list(unwrap(self.msg_embed).parameters())
+            + _msg_params
             + list(unwrap(self.cond_lat).parameters())
             + list(unwrap(self.cond_64).parameters())
             + list(unwrap(self.wm_decoder).parameters())
@@ -2352,8 +2407,18 @@ class WatermarkTrainer:
             # AMP-fix: F.binary_cross_entropy is unsafe under autocast (inputs are post-sigmoid).
             # Force fp32 for this specific call — BCE_with_logits would need pre-sigmoid input.
             with torch.amp.autocast('cuda', enabled=False):
-                L_teacher = F.binary_cross_entropy(P_lat_soft.float(), T_lat.float()) + \
-                            F.binary_cross_entropy(P_64_soft.float(), T_skip.float())
+                # MULTIBIT-FIX: clamp inputs to [eps, 1-eps] before BCE — fp16 sigmoid
+                # under autocast can drift outside [0, 1] on 512x512 spatial features,
+                # triggering CUDA assertion. nan_to_num filters NaN/Inf which clamp
+                # alone cannot handle (clamp(NaN) = NaN, still fails BCE assertion).
+                # Worked silently on grayscale 120x160; manifests on color 512x512.
+                _bce_eps = 1e-6
+                _Pl = torch.nan_to_num(P_lat_soft.float(), nan=0.5, posinf=1.0-_bce_eps, neginf=_bce_eps).clamp(_bce_eps, 1.0 - _bce_eps)
+                _P6 = torch.nan_to_num(P_64_soft.float(), nan=0.5, posinf=1.0-_bce_eps, neginf=_bce_eps).clamp(_bce_eps, 1.0 - _bce_eps)
+                _Tl = torch.nan_to_num(T_lat.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                _T6 = torch.nan_to_num(T_skip.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                L_teacher = F.binary_cross_entropy(_Pl, _Tl) + \
+                            F.binary_cross_entropy(_P6, _T6)
         else:
             L_teacher = P_lat_soft.new_tensor(0.0)
 
@@ -2767,17 +2832,31 @@ class WatermarkTrainer:
         w64 = self.g_64(S64)
 
         # ── Multi-bit message conditioning ─────────────────────
-        # Generate random message per batch (standard SoTA approach)
+        # In split mode: separate messages for latent vs skip64 paths.
+        # In single mode: same message goes to both (redundant encoding).
         _B = Z.shape[0]
-        _msg_bits = random_message_bits(_B, self._wm_n_bits, Z.device)
-        _msg_emb = self.msg_embed(_msg_bits)
-        # Additive message-conditioned residuals (parallel branch)
-        _z_msg = self.cond_lat(Z, _msg_emb)
-        _w64_msg = self.cond_64(S64, _msg_emb)
+        if self._wm_use_split:
+            _msg_bits_lat = random_message_bits(_B, self._wm_n_bits_lat, Z.device)
+            _msg_bits_skip = random_message_bits(_B, self._wm_n_bits_skip, Z.device)
+            _msg_emb_lat = self.msg_embed_lat(_msg_bits_lat)
+            _msg_emb_skip = self.msg_embed_skip(_msg_bits_skip)
+            # Stash for loss computation
+            self._last_msg_bits_lat = _msg_bits_lat
+            self._last_msg_bits_skip = _msg_bits_skip
+            # Concatenated for log-line single 'msg_bits' field consumers
+            self._last_msg_bits = torch.cat([_msg_bits_lat, _msg_bits_skip], dim=1)
+        else:
+            _msg_bits = random_message_bits(_B, self._wm_n_bits, Z.device)
+            _msg_emb_lat = self.msg_embed(_msg_bits)
+            _msg_emb_skip = _msg_emb_lat  # same embedding in single mode
+            self._last_msg_bits = _msg_bits
+            self._last_msg_bits_lat = _msg_bits
+            self._last_msg_bits_skip = _msg_bits
+        # Additive message-conditioned residuals (parallel branches)
+        _z_msg = self.cond_lat(Z, _msg_emb_lat)
+        _w64_msg = self.cond_64(S64, _msg_emb_skip)
         z_pat = z_pat + _z_msg
         w64 = w64 + _w64_msg
-        # Stash message bits for later use in decoder loss
-        self._last_msg_bits = _msg_bits
 
 
         # ROI + frequency shaping
@@ -2932,6 +3011,34 @@ class WatermarkTrainer:
         # patterns
         z_pat = self.g_lat(Z)
         w64 = self.g_64(S64)
+
+        # ── Multi-bit message conditioning ─────────────────────
+        # In split mode: separate messages for latent vs skip64 paths.
+        # In single mode: same message goes to both (redundant encoding).
+        _B = Z.shape[0]
+        if self._wm_use_split:
+            _msg_bits_lat = random_message_bits(_B, self._wm_n_bits_lat, Z.device)
+            _msg_bits_skip = random_message_bits(_B, self._wm_n_bits_skip, Z.device)
+            _msg_emb_lat = self.msg_embed_lat(_msg_bits_lat)
+            _msg_emb_skip = self.msg_embed_skip(_msg_bits_skip)
+            # Stash for loss computation
+            self._last_msg_bits_lat = _msg_bits_lat
+            self._last_msg_bits_skip = _msg_bits_skip
+            # Concatenated for log-line single 'msg_bits' field consumers
+            self._last_msg_bits = torch.cat([_msg_bits_lat, _msg_bits_skip], dim=1)
+        else:
+            _msg_bits = random_message_bits(_B, self._wm_n_bits, Z.device)
+            _msg_emb_lat = self.msg_embed(_msg_bits)
+            _msg_emb_skip = _msg_emb_lat  # same embedding in single mode
+            self._last_msg_bits = _msg_bits
+            self._last_msg_bits_lat = _msg_bits
+            self._last_msg_bits_skip = _msg_bits
+        # Additive message-conditioned residuals (parallel branches)
+        _z_msg = self.cond_lat(Z, _msg_emb_lat)
+        _w64_msg = self.cond_64(S64, _msg_emb_skip)
+        z_pat = z_pat + _z_msg
+        w64 = w64 + _w64_msg
+
 
         # ROI + shaping
         P_lat_e = self._soft_roi_mask(P_lat)
@@ -3396,20 +3503,44 @@ class WatermarkTrainer:
         # BCE under fp32 for numerical stability (consistent with other BCE losses)
         with torch.amp.autocast('cuda', enabled=False):
             _wm_for_decoder = both01.float().clamp(0, 1)
-            _decoder_logits, _det_logits = self.wm_decoder.forward_full(_wm_for_decoder)
-            # Auxiliary: also decode clean (base01) — should give random bits
-            # which trains the decoder to require an actual watermark to extract.
             _clean_for_decoder = x01.float().clamp(0, 1)
-            _decoder_logits_clean, _det_logits_clean = self.wm_decoder.forward_full(_clean_for_decoder)
-            # Loss: BCE on watermarked, detection loss for both classes
-            _msg_target = self._last_msg_bits.float()
-            _L_dec_bits = F.binary_cross_entropy_with_logits(_decoder_logits, _msg_target)
-            # Detection: 1 for watermarked, 0 for clean
-            _det_targets_wm = torch.ones_like(_det_logits.squeeze(-1))
-            _det_targets_clean = torch.zeros_like(_det_logits_clean.squeeze(-1))
-            _L_det_wm = F.binary_cross_entropy_with_logits(_det_logits.squeeze(-1), _det_targets_wm)
-            _L_det_clean = F.binary_cross_entropy_with_logits(_det_logits_clean.squeeze(-1), _det_targets_clean)
-            _L_decoder = _L_dec_bits + 0.25 * (_L_det_wm + _L_det_clean)
+            if self._wm_use_split:
+                # Split-channel forward: returns (logits_lat, logits_skip, detect)
+                _lg_lat, _lg_skip, _det_logits = self.wm_decoder.forward_full(_wm_for_decoder)
+                _lg_lat_c, _lg_skip_c, _det_logits_clean = self.wm_decoder.forward_full(_clean_for_decoder)
+                # Split BCE loss
+                _loss_dict = split_decoder_loss(
+                    logits_lat=_lg_lat,
+                    logits_skip=_lg_skip,
+                    true_bits_lat=self._last_msg_bits_lat.float(),
+                    true_bits_skip=self._last_msg_bits_skip.float(),
+                    detection_logits=None,
+                    is_watermarked=None,
+                )
+                _L_dec_bits = _loss_dict['total']
+                # Detection: 1 for watermarked, 0 for clean (computed on both)
+                _det_targets_wm = torch.ones_like(_det_logits.squeeze(-1))
+                _det_targets_clean = torch.zeros_like(_det_logits_clean.squeeze(-1))
+                _L_det_wm = F.binary_cross_entropy_with_logits(_det_logits.squeeze(-1), _det_targets_wm)
+                _L_det_clean = F.binary_cross_entropy_with_logits(_det_logits_clean.squeeze(-1), _det_targets_clean)
+                _L_decoder = _L_dec_bits + 0.25 * (_L_det_wm + _L_det_clean)
+                # Combined logits for accuracy metric
+                _decoder_logits = torch.cat([_lg_lat, _lg_skip], dim=1)
+                self._last_bit_acc_lat = bit_accuracy(_lg_lat, self._last_msg_bits_lat)
+                self._last_bit_acc_skip = bit_accuracy(_lg_skip, self._last_msg_bits_skip)
+            else:
+                # Single-channel forward: returns (logits, detect)
+                _decoder_logits, _det_logits = self.wm_decoder.forward_full(_wm_for_decoder)
+                _decoder_logits_clean, _det_logits_clean = self.wm_decoder.forward_full(_clean_for_decoder)
+                _msg_target = self._last_msg_bits.float()
+                _L_dec_bits = F.binary_cross_entropy_with_logits(_decoder_logits, _msg_target)
+                _det_targets_wm = torch.ones_like(_det_logits.squeeze(-1))
+                _det_targets_clean = torch.zeros_like(_det_logits_clean.squeeze(-1))
+                _L_det_wm = F.binary_cross_entropy_with_logits(_det_logits.squeeze(-1), _det_targets_wm)
+                _L_det_clean = F.binary_cross_entropy_with_logits(_det_logits_clean.squeeze(-1), _det_targets_clean)
+                _L_decoder = _L_dec_bits + 0.25 * (_L_det_wm + _L_det_clean)
+                self._last_bit_acc_lat = 0.0
+                self._last_bit_acc_skip = 0.0
 
         # Apply warmup ramp
         _dec_ramp = min(1.0, max(0.0, (epoch - _dec_warmup) / max(1, _dec_warmup)))
@@ -3430,13 +3561,23 @@ class WatermarkTrainer:
         self.opt_g.zero_grad(set_to_none=True)
         self.scaler_g.scale(L_g).backward()  # AMP: scaled backward
         self.scaler_g.unscale_(self.opt_g)  # AMP: unscale before clip
+        # Build deduped msg-module list for gradient clipping (split mode safety)
+        _msg_modules_clip = []
+        _seen_clip = set()
+        for _m in (self.msg_embed, getattr(self, 'msg_embed_lat', None), getattr(self, 'msg_embed_skip', None)):
+            if _m is not None and id(unwrap(_m)) not in _seen_clip:
+                _seen_clip.add(id(unwrap(_m)))
+                _msg_modules_clip.append(_m)
+        _msg_params_clip = []
+        for _m in _msg_modules_clip:
+            _msg_params_clip.extend(list(unwrap(_m).parameters()))
         torch.nn.utils.clip_grad_norm_(
             list(unwrap(self.mask_lat).parameters())
             + list(unwrap(self.mask_64).parameters())
             + list(unwrap(self.g_lat).parameters())
             + list(unwrap(self.g_64).parameters())
             + list(unwrap(self.freq_ctrl).parameters())
-            + list(unwrap(self.msg_embed).parameters())
+            + _msg_params_clip
             + list(unwrap(self.cond_lat).parameters())
             + list(unwrap(self.cond_64).parameters())
             + list(unwrap(self.wm_decoder).parameters()),
@@ -5495,9 +5636,14 @@ class WatermarkTrainer:
             "format_version": 3,
             "wm_decoder": unwrap(self.wm_decoder).state_dict(),
             "msg_embed": unwrap(self.msg_embed).state_dict(),
+            "msg_embed_lat": unwrap(self.msg_embed_lat).state_dict() if hasattr(self, "msg_embed_lat") else None,
+            "msg_embed_skip": unwrap(self.msg_embed_skip).state_dict() if hasattr(self, "msg_embed_skip") else None,
             "cond_lat": unwrap(self.cond_lat).state_dict(),
             "cond_64": unwrap(self.cond_64).state_dict(),
             "wm_n_bits": int(self._wm_n_bits),
+            "wm_n_bits_lat": int(getattr(self, "_wm_n_bits_lat", self._wm_n_bits)),
+            "wm_n_bits_skip": int(getattr(self, "_wm_n_bits_skip", 0)),
+            "wm_use_split": bool(getattr(self, "_wm_use_split", False)),
             "kind": "opt_g",
             "epoch": int(epoch),
             "meta": {
@@ -5695,6 +5841,7 @@ class WatermarkTrainer:
                         f"ng(raw/wm/gap)={val_probe_stats.get('acc_raw_ng', float('nan')):.3f}/{val_probe_stats.get('acc_both_ng', float('nan')):.3f}/{val_probe_stats.get('gap_ng', float('nan')):+.3f} "
                         f"gs={val_probe_stats.get('gate_specific_gap', float('nan')):+.3f} | "
                         f"BIT acc={getattr(self, '_last_bit_acc', 0.0):.3f} msg={getattr(self, '_last_msg_acc', 0.0):.3f} "
+                        f"lat={getattr(self, '_last_bit_acc_lat', 0.0):.3f} skp={getattr(self, '_last_bit_acc_skip', 0.0):.3f} "
                         f"Ldec={getattr(self, '_last_L_dec', 0.0):.3f} w={getattr(self, '_last_dec_active_w', 0.0):.2f} | "
                         f"t={_t_batch_s:.2f}s(g={_t_gen_s:.2f}/c2={_t_c2_s:.2f}) ema={_ema_t_batch:.2f}s/it"
                     )
@@ -5989,12 +6136,16 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--dataset", type=str, default="ornl_grayscale",
                     choices=list(DATASETS.keys()),
                     help="Dataset configuration key (see wm_dataset_configs.py)")
-    ap.add_argument("--n_bits", type=int, default=32, help="Number of watermark message bits")
-    ap.add_argument("--msg_embed_dim", type=int, default=256, help="Message embedding feature dim")
+    ap.add_argument("--n_bits", type=int, default=64, help="Number of watermark message bits (default 64 = SoTA-comparable payload)")
+    ap.add_argument("--msg_embed_dim", type=int, default=256, help="Message embedding feature dim (use 384 for color datasets, 256 for grayscale)")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0, help="Weight of L_decoder in total loss")
     ap.add_argument("--decoder_warmup_epochs", type=int, default=1, help="Epochs before decoder loss activates")
     ap.add_argument("--wm_export_sample_every", type=int, default=10, help="Save 1 in N watermarked images (1=save all)")
     ap.add_argument("--decoder_warmstart_from_c1", type=str, default="", help="Path to C1 .pth to warm-start decoder backbone (empty = no warm-start)")
+    # ── Option B: split-channel encoding ──
+    ap.add_argument("--use_split_channels", type=int, default=0, choices=[0, 1], help="1 = split bits between latent and skip64 paths (Option B), 0 = single-channel redundant encoding")
+    ap.add_argument("--n_bits_lat", type=int, default=0, help="Bits assigned to latent path (0 = read from config or use n_bits//2)")
+    ap.add_argument("--n_bits_skip", type=int, default=0, help="Bits assigned to skip64 path (0 = read from config or use n_bits-lat)")
     ap.add_argument("--pub_collage_per_class", type=int, default=10, help="How many publication collages to save per class per epoch")
     ap.add_argument("--pub_collage_keep_train_debug", type=int, default=0, choices=[0, 1],
                     help="Also save train-time debug collages using publication panels")
@@ -6249,6 +6400,10 @@ def parse_args() -> TrainConfig:
         decoder_loss_weight=float(args.decoder_loss_weight),
         decoder_warmup_epochs=int(args.decoder_warmup_epochs),
         wm_export_sample_every=int(args.wm_export_sample_every),
+        decoder_warmstart_from_c1=str(args.decoder_warmstart_from_c1),
+        use_split_channels=bool(args.use_split_channels),
+        n_bits_lat=int(args.n_bits_lat),
+        n_bits_skip=int(args.n_bits_skip),
         wm_jpeg_quality=int(args.wm_jpeg_quality),
         wm_export_format=str(args.wm_export_format),
         avoid_black_thr=float(args.avoid_black_thr),

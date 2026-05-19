@@ -179,3 +179,116 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+ ============================================================
+# Project-specific (ML/PyTorch/Watermarking)
+# ============================================================
+
+# ---- PyTorch model weights & checkpoints ----
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.tflite
+*.pkl
+*.pickle
+checkpoints/
+saved_models/
+pretrained/
+weights/
+
+# ---- Experiment tracking ----
+wandb/
+mlruns/
+mlartifacts/
+lightning_logs/
+tb_logs/
+tensorboard/
+runs/
+outputs/
+hydra_outputs/
+multirun/
+.neptune/
+
+# ---- Datasets & data artifacts ----
+data/raw/
+data/processed/
+data/interim/
+data/external/
+datasets/
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.tfrecord
+*.lmdb
+*.parquet
+*.feather
+
+# ---- Image/video artifacts (watermarking specific) ----
+# Закомментируй, если входные изображения должны быть в репо
+# *.png
+# *.jpg
+# *.jpeg
+# *.tiff
+# *.bmp
+# Но точно игнорируем папки с генерируемыми/промежуточными:
+generated/
+intermediate/
+samples/
+results/
+visualizations/
+figures/output/
+attacks/
+adversarial/
+
+# ---- CUDA & GPU artifacts ----
+.nv/
+*.nv
+nccl_*.log
+
+# ---- Notebooks: убрать output из коммитов ----
+# Раскомментируй, если хочешь, чтобы output ноутбуков НЕ коммитился
+# (тогда настрой pre-commit с nbstripout)
+# *.ipynb
+
+# ---- IDE / editors ----
+.idea/
+*.iml
+*.iws
+.vscode/
+*.code-workspace
+.history/
+
+# ---- OS noise ----
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
+
+# ---- Local config & secrets ----
+.env.local
+.env.*.local
+config.local.yaml
+config.local.json
+secrets.yaml
+*.key
+*.pem
+api_keys.txt
+
+# ---- Logs (помимо уже игнорируемых *.log выше) ----
+logs/
+*.log.*
+
+# ---- Temporary / scratch ----
+scratch/
+tmp/
+temp/
+.tmp/
+*.tmp
+*.bak
+*.swp
+*~

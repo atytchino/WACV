@@ -3,6 +3,31 @@
 """
 Size-agnostic, anti-checkerboard AutoEncoder.
 
+═══════════════════════════════════════════════════════════════════════════════
+PATCH 2026-05-19 — ext_gain_lat / ext_gain_skip reduction
+═══════════════════════════════════════════════════════════════════════════════
+Original values (ext_gain_lat=16.0, ext_gain_skip=12.0) caused catastrophic
+color watermark training collapse in 7+ runs on TLD and AFHQ datasets.
+The mechanism (confirmed by verify_ae_pipeline_v2.py Test 7):
+
+    lat_wm = lat + gain_lat * a_lat * roi_lat * wm_lat
+           = lat + 16.0 * 1.0 * 1.0 * wm_lat       # gain=16
+           = lat + ~16 perturbation (when wm_lat is tanh-saturated)
+
+Typical latent activations after GN are O(1-2), so adding ±16 pushes the
+decoder far out of training distribution. The decoder produced NaN/Inf at
+some pixels; the trainer's nan_to_num() band-aid then converted those NaN
+pixels to 0.0 (BLACK), creating apparent dMax~0.95 + SSIM~0.0005 collapse.
+
+Reduced values (gain_lat=4, gain_skip=3) keep latent perturbation within
+~2-3x typical activation magnitude — large enough for detectability,
+small enough to stay in distribution.
+
+NO AE RETRAINING NEEDED — ext_gain_lat/ext_gain_skip are runtime config
+values, not learned weights. Existing TLD_AE / AFHQ_AE checkpoints work
+unchanged with this file.
+═══════════════════════════════════════════════════════════════════════════════
+
 Main fixes vs the first draft:
 - mixed gray/color batches now work per-sample (no batch-average gate bug)
 - forward_plain accepts 1ch or 3ch input
@@ -302,8 +327,17 @@ class AEConfig:
     gray_like_eps: float = 0.010
     chroma_res_scale: float = 0.25
     chroma_abs_clip: float = 0.75
-    ext_gain_lat: float = 16.0
-    ext_gain_skip: float = 12.0
+    # PATCH 2026-05-19: reduced ext_gain_lat from 16.0 -> 4.0 (and ext_gain_skip 12.0 -> 3.0).
+    # Original values caused latent perturbation magnitudes of ±16 in latent space when
+    # a_lat=1.0 and wm_lat is tanh-saturated. Typical latent activations after GN are O(1-2),
+    # so a ±16 perturbation pushed the decoder far out of training distribution, producing
+    # NaN/Inf in some pixels. The trainer's nan_to_num() band-aid then converted those NaN
+    # pixels to 0.0 (black), creating the catastrophic dMax~0.95 + SSIM~0.0005 collapse seen
+    # in 7+ color watermark training attempts (RUN03-RUN07 on TLD/AFHQ).
+    # Confirmed via verify_ae_pipeline_v2.py Test 7: only extreme α=10 (effective gain×α=160)
+    # could reproduce the catastrophic state; reasonable α with reduced gain stays bounded.
+    ext_gain_lat: float = 4.0    # was 16.0
+    ext_gain_skip: float = 3.0   # was 12.0
     ext_direct_gain_lat: float = 0.040
     ext_direct_gain_skip: float = 0.050
     ext_direct_blur_k: int = 5

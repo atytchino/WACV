@@ -11,7 +11,6 @@ inference scripts, evaluation scripts, and ablation studies.
 from __future__ import annotations
 
 import torch
-from typing import Optional
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -145,89 +144,25 @@ class ConditionedResidualBranch(nn.Module):
         in_ch: feature channels of the latent / skip64 path being modulated.
         msg_dim: dimensionality of the message embedding.
         mid: internal channel count (keep small to limit parameters).
-        film_init_std: std of normal init for the FiLM projection weights.
-            0.0 (default) reproduces the legacy zero-init behavior.
-        out_init_std: std of normal init for the output 1x1 conv weights.
-            0.0 (default) reproduces the legacy zero-init behavior.
-
-    ═══════════════════════════════════════════════════════════════════════
-    PATCH 2026-07-04 — double-zero-init deadlock fix (root cause of BER=0.5)
-    ═══════════════════════════════════════════════════════════════════════
-    Diagnosis: the legacy init zeroed BOTH self.film AND self.out.
-      * out=0  → gradient to everything upstream of `out` (conv stack, FiLM,
-        reduce) is exactly zero until `out` itself grows.
-      * film=0 → FiLM is the identity, so h = conv(reduce(x)) depends on
-        CONTENT ONLY. Even once `out` grows, it grows in message-INDEPENDENT
-        directions (its gradient ∝ upstream_grad ⊗ h, and h carries no bits).
-    The only loss rewarding message-dependence (L_decoder, random targets
-    per batch, small weight among ~12 competing terms, path through a frozen
-    AE + delta shaping + tanh clip) cannot bootstrap through this double
-    block. Observed signature: decoder bit logits collapse to 0
-    (L_bits = ln2 = 0.693, BER = exactly 0.500) while the SAME decoder's
-    detection head separates wm/original almost perfectly.
-
-    Fix: allow small non-zero init for BOTH film and out. Both must be
-    non-zero simultaneously — unlocking only one keeps the other block in
-    place. Recommended experiment values (behind trainer CLI flags):
-        --cond_film_init_std 0.01 --cond_out_init_std 0.001
-    Defaults (0.0 / 0.0) keep the legacy behavior for baseline parity runs.
-    ═══════════════════════════════════════════════════════════════════════
     """
 
-    def __init__(self, in_ch: int, msg_dim: int = 256, mid: int = 32,
-                 film_init_std: float = 0.0, out_init_std: float = 0.0,
-                 inject: str = 'film', n_bits: int = 0):
+    def __init__(self, in_ch: int, msg_dim: int = 256, mid: int = 32):
         super().__init__()
         self.in_ch = in_ch
         self.mid = mid
-        self.film_init_std = float(film_init_std)
-        self.out_init_std = float(out_init_std)
-        self.inject = str(inject).lower()
-        self.n_bits = int(n_bits)
-        if self.inject not in ('film', 'concat'):
-            raise ValueError(f"inject must be 'film' or 'concat', got {inject!r}")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PATCH 2026-07-06 — concat injection (HiDDeN/MBRS-style), behind a flag
-        # ═══════════════════════════════════════════════════════════════════
-        # Empirical result that motivated this: with FiLM injection, even a
-        # freshly-initialized branch (film_init_std=0.01, out_init_std=0.001)
-        # produced msgRMS≈0 at the very first probe (it25) — the message
-        # component is drowned by the content pattern scale after unit_rms
-        # normalization, so bits never reach the image and BER stays 0.5.
-        #
-        # concat mode instead tiles the signed message bits into their own
-        # spatial channels and concatenates them to the input BEFORE the
-        # reduce conv. The path bits -> output then exists through ordinary
-        # convolutions from step 1, with standard init — no bootstrap, no
-        # film/out-std sensitivity, direct gradient. This is exactly how
-        # HiDDeN and MBRS inject the payload.
-        #
-        # NOTE: content-binding FiLM in AE_ContentBound (ContentEncoder ->
-        # WMGenerators) is a SEPARATE mechanism and is untouched by this flag.
-        # This flag only changes how the *message* enters this residual branch.
-        # ═══════════════════════════════════════════════════════════════════
-        reduce_in = in_ch + (self.n_bits if self.inject == 'concat' else 0)
 
         # Reduce input channels (mirrors _MiniUNetWM structure)
         self.reduce = nn.Sequential(
-            nn.Conv2d(reduce_in, mid, 1, 1, 0, bias=False),
+            nn.Conv2d(in_ch, mid, 1, 1, 0, bias=False),
             nn.GroupNorm(min(8, mid), mid),
             nn.SiLU(inplace=True),
         )
 
-        # FiLM projection: msg_emb -> per-channel (gamma, beta).
-        # Only used in inject='film' mode; omitted entirely in concat mode
-        # so there are no dead parameters.
-        if self.inject == 'film':
-            self.film = nn.Linear(msg_dim, 2 * mid)
-            if self.film_init_std > 0.0:
-                nn.init.normal_(self.film.weight, std=self.film_init_std)
-            else:
-                nn.init.zeros_(self.film.weight)
-            nn.init.zeros_(self.film.bias)
-        else:
-            self.film = None
+        # FiLM projection: msg_emb -> per-channel (gamma, beta)
+        self.film = nn.Linear(msg_dim, 2 * mid)
+        # Initialize FiLM to start as identity (gamma=0, beta=0 after init)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
 
         # Conv stack after FiLM modulation
         self.conv = nn.Sequential(
@@ -241,55 +176,29 @@ class ConditionedResidualBranch(nn.Module):
 
         # Project back to input channel count
         self.out = nn.Conv2d(mid, in_ch, 1, 1, 0)
-        if self.inject == 'concat':
-            # concat mode: standard small init so the message path is active
-            # from step 1 (bits already flow through reduce/conv). A modest
-            # std keeps the initial residual small relative to the content
-            # pattern but non-negligible; out_init_std overrides if given.
-            _os = self.out_init_std if self.out_init_std > 0.0 else 0.02
-            nn.init.normal_(self.out.weight, std=_os)
-            nn.init.zeros_(self.out.bias)
-        else:
-            if self.out_init_std > 0.0:
-                nn.init.normal_(self.out.weight, std=self.out_init_std)
-            else:
-                nn.init.zeros_(self.out.weight)
-            nn.init.zeros_(self.out.bias)
+        # Initialize output to zero so the branch starts as identity (zero residual)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
-    def forward(self, x: torch.Tensor, msg_emb: torch.Tensor,
-                signed_bits: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, msg_emb: torch.Tensor) -> torch.Tensor:
         """Generate message-conditioned residual.
 
         Args:
             x: [B, in_ch, H, W] feature map (latent or skip64).
-            msg_emb: [B, msg_dim] message embedding (used by inject='film').
-            signed_bits: [B, n_bits] message bits in {-1,+1} (used by
-                inject='concat'). Required in concat mode; ignored in film
-                mode. Callers that pass only msg_emb keep working in film mode.
+            msg_emb: [B, msg_dim] message embedding.
 
         Returns:
             [B, in_ch, H, W] additive residual to be summed with the existing
             watermark residual from GLat / G64.
         """
-        if self.inject == 'concat':
-            if signed_bits is None:
-                raise ValueError(
-                    "ConditionedResidualBranch(inject='concat') requires "
-                    "signed_bits [B, n_bits]; got None")
-            B, _, H, W = x.shape
-            # Tile each signed bit into its own full-resolution channel and
-            # concatenate to the feature map: [B, in_ch + n_bits, H, W].
-            bmap = signed_bits.view(B, self.n_bits, 1, 1).expand(B, self.n_bits, H, W)
-            h = self.reduce(torch.cat([x, bmap.to(x.dtype)], dim=1))
-            h = self.conv(h)
-            return self.out(h)
-
-        # inject == 'film' (legacy path)
         h = self.reduce(x)  # [B, mid, H, W]
+
+        # FiLM modulation
         film_params = self.film(msg_emb)  # [B, 2*mid]
         gamma, beta = film_params.chunk(2, dim=1)  # [B, mid] each
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # [B, mid, 1, 1]
         beta = beta.unsqueeze(-1).unsqueeze(-1)
+
         h = h * (1.0 + gamma) + beta  # FiLM applied
         h = self.conv(h)
         return self.out(h)  # [B, in_ch, H, W]

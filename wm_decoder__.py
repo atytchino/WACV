@@ -40,44 +40,8 @@ import torchvision
 # Backbone variants
 # -------------------------
 
-def _convert_bn_to_gn(module: nn.Module, groups: int = 32) -> nn.Module:
-    """Recursively replace every BatchNorm2d with GroupNorm (PATCH 2026-07-07).
-
-    Why: the decoder's BatchNorm was caught cheating via batch statistics — in
-    training it saw batch-homogeneous forwards (wm-only / clean-only) and
-    separated by batch stats, which collapses under eval running-stats. This
-    corrupts BOTH the detection head AND (the real problem) the bit heads on
-    validation: the decoder can appear to train while VAL-BER stays at 50%.
-    GroupNorm normalizes per-sample over channel groups, so there is no batch
-    dependence and no train/val statistics mismatch — exactly what a decoder
-    trained at batch_size=4 needs.
-
-    num_groups is min(groups, C) and is reduced to the largest divisor of C not
-    exceeding `groups` so every channel count (64/128/256/512) divides evenly.
-    Affine weights are preserved in shape (GN has the same per-channel affine as
-    BN), but running stats are dropped (GN has none).
-    """
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.BatchNorm2d):
-            C = child.num_features
-            g = min(groups, C)
-            while C % g != 0:
-                g -= 1
-            gn = nn.GroupNorm(num_groups=g, num_channels=C, affine=True)
-            # carry over the affine params so a warm-start isn't wrecked
-            if child.affine:
-                with torch.no_grad():
-                    gn.weight.copy_(child.weight)
-                    gn.bias.copy_(child.bias)
-            setattr(module, name, gn)
-        else:
-            _convert_bn_to_gn(child, groups=groups)
-    return module
-
-
 def _build_resnet_backbone(arch: str, in_channels: int,
-                           first_stride: int = 2,
-                           norm: str = 'bn', gn_groups: int = 32) -> nn.Module:
+                           first_stride: int = 2) -> nn.Module:
     """Build a ResNet feature extractor with adjusted first conv.
 
     Args:
@@ -86,10 +50,6 @@ def _build_resnet_backbone(arch: str, in_channels: int,
         first_stride: stride of conv1. 2 = torchvision default (legacy);
             1 preserves high-frequency watermark signal (PATCH 2026-07-04,
             same trick as C2's base.conv1.stride=(1,1)).
-        norm: 'bn' = torchvision BatchNorm (legacy); 'gn' = GroupNorm
-            (PATCH 2026-07-07, removes batch-stat cheating; needed for small
-            batches and for train/val consistency).
-        gn_groups: target group count for GroupNorm (clamped per layer).
 
     Returns:
         nn.Module with .fc replaced by Identity. Output is [B, 512] features.
@@ -116,13 +76,6 @@ def _build_resnet_backbone(arch: str, in_channels: int,
         raise ValueError(f"first_stride must be 1 or 2, got {first_stride}")
     if fs != 2:
         model.conv1.stride = (fs, fs)
-
-    # PATCH 2026-07-07: optional BatchNorm -> GroupNorm conversion.
-    _norm = str(norm).lower()
-    if _norm not in ('bn', 'gn'):
-        raise ValueError(f"norm must be 'bn' or 'gn', got {norm!r}")
-    if _norm == 'gn':
-        _convert_bn_to_gn(model, groups=int(gn_groups))
 
     # Replace classifier head with Identity — we will attach our own heads
     model.fc = nn.Identity()
@@ -163,19 +116,15 @@ class StandaloneDecoder(nn.Module):
         arch: str = 'resnet34',
         hidden_dim: int = 256,
         first_stride: int = 2,
-        norm: str = 'bn',
-        gn_groups: int = 32,
     ):
         super().__init__()
         self.n_bits = n_bits
         self.in_channels = in_channels
         self.arch = arch
         self.first_stride = int(first_stride)
-        self.norm = str(norm)
 
         self.backbone = _build_resnet_backbone(arch, in_channels,
-                                               first_stride=first_stride,
-                                               norm=norm, gn_groups=gn_groups)
+                                               first_stride=first_stride)
         feat_dim = self.backbone._feat_dim
 
         # Bit extraction head — two-layer MLP for non-linearity
@@ -325,8 +274,6 @@ class SplitChannelDecoder(nn.Module):
         arch: str = 'resnet34',
         hidden_dim: int = 256,
         first_stride: int = 2,
-        norm: str = 'bn',
-        gn_groups: int = 32,
     ):
         super().__init__()
         self.n_bits_lat = n_bits_lat
@@ -335,11 +282,9 @@ class SplitChannelDecoder(nn.Module):
         self.in_channels = in_channels
         self.arch = arch
         self.first_stride = int(first_stride)
-        self.norm = str(norm)
 
         self.backbone = _build_resnet_backbone(arch, in_channels,
-                                               first_stride=first_stride,
-                                               norm=norm, gn_groups=gn_groups)
+                                               first_stride=first_stride)
         feat_dim = self.backbone._feat_dim
 
         # Head for bits stored in the latent path

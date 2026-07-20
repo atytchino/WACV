@@ -3783,25 +3783,11 @@ class WatermarkTrainer:
         # This forces WM to be content-entangled, not a global additive pattern.
         L_transfer = both01.new_tensor(0.0)
         if epoch >= _t_start and B > 1 and transfer_lam > 0.0:
-            # FIX-1 (gradient): the transplant must stay DIFFERENTIABLE w.r.t. the
-            # generator. The previous version built it under torch.no_grad() from a
-            # detached delta, so only C2's wm_head learned from this loss and the
-            # generator was never pushed to make delta content-specific -- i.e. the
-            # watermark was never content-entangled at all. Keep x01 detached (it is
-            # data), but let delta carry gradient back into g_lat / g_64 / FiLM.
-            delta = both01 - x01.detach()                      # differentiable
-            # FIX-2 (derangement): torch.randperm has an expected 1 fixed point per
-            # batch for ANY B. A fixed point makes transplant01[i] == both01[i] -- a
-            # LEGITIMATE watermark -- and the loss then says "do not detect this",
-            # fighting the detection objective on ~1 in 4 samples at B=4. A random
-            # cyclic shift by 1..B-1 is a guaranteed derangement.
-            _shift = int(torch.randint(1, B, (1,), device=x01.device).item())
-            idx_perm = (torch.arange(B, device=x01.device) + _shift) % B
-            transplant01 = (x01[idx_perm].detach() + delta).clamp(0.0, 1.0)
-            transplantN = transplant01 * 2.0 - 1.0
-            if not transplantN.requires_grad:
-                print("[L_TRANSFER][WARN] no gradient path to the generator -- "
-                      "the fix is not active", flush=True)
+            with torch.no_grad():
+                delta = (both01.detach() - x01.detach())  # [B,C,H,W] WM residual
+                idx_perm = torch.randperm(B, device=x01.device)
+                transplant01 = (x01[idx_perm] + delta).clamp(0.0, 1.0)
+                transplantN = transplant01 * 2.0 - 1.0
             try:
                 _, wm_transplant, _ = self.c2(transplantN, gate=True)
                 t_zeros = torch.zeros_like(wm_transplant)  # must NOT detect WM

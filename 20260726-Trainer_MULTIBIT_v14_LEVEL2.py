@@ -30,18 +30,7 @@ Three patches applied to fix this (all marked with "PATCH 2026-05-19"):
 
 Use this trainer with AE_ContentBound from /20260519/ (same date) for proper
 gain values. Old AE checkpoints (TLD_AE, AFHQ_AE) WORK with new gains — these
-are runtime config values, not learned weights.
-═══════════════════════════════════════════════════════════════════════════════
 
-This file is derived from your FIXED18 trainer and intentionally keeps the same
-high-level interfaces:
-  - AE must expose: enc(y01)->{'latent','s64'}, forward_plain(x01), embed_external_wm_gray(), embed_external_wm()
-
-Tested assumptions:
-  - Input images are loaded from train_root/<class>/* and val_root/<class>/*
-  - Autoencoder is frozen; gradients flow only to ROI masks + pattern generators and C2
-
-Author: ChatGPT (patched for Feb 2026 request)
 """
 
 from __future__ import annotations

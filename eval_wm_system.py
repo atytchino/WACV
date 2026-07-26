@@ -634,6 +634,80 @@ def run_universal(tr, max_batches=None):
 
 
 @torch.no_grad()
+@torch.no_grad()
+def run_dump_pairs(tr, out_dir, max_batches=None, gray=False):
+    """Dump paired original + watermarked PNGs for the whole val set.
+
+    This is the foundation for the attack harness and Level-2 work: every forgery
+    attack needs BOTH the original x and the watermarked x+d of the SAME image, so
+    the residual d = wm - orig can be lifted, flipped, scaled or transplanted. The
+    trainer's own export writes only watermarked images on a subset; this writes
+    guaranteed pairs over the FULL val set, with the class preserved in the path.
+
+    Layout (attack-harness ready):
+        <out_dir>/orig/<class>/<stem>.png
+        <out_dir>/wm/<class>/<stem>.png
+    Same <class>/<stem> in both trees => a pair. d is recomputed on the fly by the
+    attack code (wm - orig), so it is not stored.
+    """
+    import os
+    from pathlib import Path as _Path
+    try:
+        from torchvision.utils import save_image
+    except Exception as e:
+        raise SystemExit(f"[FATAL] torchvision save_image unavailable: {e}")
+
+    tag = "DUMP PAIRS" + ("  [grayscale]" if gray else "")
+    _p("\n" + "=" * 78)
+    _p(tag + f"  ->  {out_dir}")
+    _p("=" * 78)
+
+    classes = list(getattr(tr, "classes", None) or getattr(tr.val_ds, "classes", []))
+    if not classes:
+        _p("  [warn] class names not found on trainer/val_ds; using numeric labels")
+
+    def cls_name(idx):
+        return classes[idx] if (classes and 0 <= idx < len(classes)) else f"class_{int(idx)}"
+
+    orig_root = _Path(out_dir) / "orig"
+    wm_root = _Path(out_dir) / "wm"
+    n = 0
+    per_class = {}
+    for xN, valid_mask, y, paths in _iter_val(tr, max_batches):
+        x01 = tr._to01(xN)
+        if gray:
+            x01 = to_gray01(x01)
+        syn = _synth(tr, x01, valid_mask, variants=("base", "both"))
+        both01 = syn["both01"].clamp(0, 1)
+        x01c = x01.clamp(0, 1)
+
+        b = int(x01.shape[0])
+        for i in range(b):
+            yi = int(y[i].item()) if hasattr(y[i], "item") else int(y[i])
+            cname = cls_name(yi)
+            # derive a stable stem from the source path when available
+            if paths is not None and i < len(paths) and paths[i]:
+                stem = _Path(str(paths[i])).stem
+            else:
+                stem = f"img_{n:06d}"
+            (orig_root / cname).mkdir(parents=True, exist_ok=True)
+            (wm_root / cname).mkdir(parents=True, exist_ok=True)
+            save_image(x01c[i],  str(orig_root / cname / f"{stem}.png"))
+            save_image(both01[i], str(wm_root / cname / f"{stem}.png"))
+            per_class[cname] = per_class.get(cname, 0) + 1
+            n += 1
+        if n % 200 < b:
+            _p(f"    dumped {n} pairs ...")
+
+    _p(f"\n  DONE: {n} pairs written")
+    for c in sorted(per_class):
+        _p(f"    {c}: {per_class[c]}")
+    _p(f"  orig -> {orig_root}")
+    _p(f"  wm   -> {wm_root}")
+    return {"mode": "dump_pairs" + ("_gray" if gray else ""), "n": n, "per_class": per_class, "out_dir": str(out_dir)}
+
+
+@torch.no_grad()
 def run_imperceptibility(tr, max_batches=None, gray=False):
     """The mandatory imperceptibility table: PSNR / SSIM / LPIPS / Linf / L2 on VAL.
 
@@ -722,7 +796,8 @@ def main():
     ap.add_argument("--mode", default="all",
                     choices=["all", "transplant", "validate", "grayscale", "hist",
                              "transplant_gray", "realval", "gray_attack", "universal",
-                             "imperceptibility", "imperceptibility_gray"])
+                             "imperceptibility", "imperceptibility_gray",
+                             "dump_pairs", "dump_pairs_gray"])
     ap.add_argument("--cross_class", action="store_true",
                     help="shuffle the val loader so transplant swaps residuals ACROSS classes "
                          "(the honest paper number; default is same-class within-batch roll)")
@@ -732,6 +807,8 @@ def main():
                     help="scratch dir for the trainer's own bookkeeping. Defaults to a "
                          "sibling of --out. NEVER point this at the reference run folder.")
     ap.add_argument("--out", default="", help="optional JSON output path")
+    ap.add_argument("--dump_dir", default="",
+                    help="for --mode dump_pairs: root dir to write orig/ and wm/ trees")
     args = ap.parse_args()
 
     mb = args.max_batches or None
@@ -754,7 +831,7 @@ def main():
                "sample, not comparable to the\n         checkpoint's full-val record.")
         except Exception as e:
             _p(f"[SUBSET] could not build a shuffled loader ({e}); subset will be class-biased.")
-    elif args.cross_class:
+    elif args.cross_class and args.mode not in ("dump_pairs", "dump_pairs_gray"):
         try:
             tr.val_loader = _shuffled_val_loader(tr)
             _p("\n[CROSS-CLASS] shuffled val loader (seed 1234): transplant now swaps residuals "
@@ -787,6 +864,14 @@ def main():
         results.append(run_imperceptibility(tr, mb, gray=False))
     if args.mode in ("all", "imperceptibility_gray"):
         results.append(run_imperceptibility(tr, mb, gray=True))
+    if args.mode == "dump_pairs":
+        if not args.dump_dir:
+            raise SystemExit("[FATAL] --mode dump_pairs requires --dump_dir")
+        results.append(run_dump_pairs(tr, args.dump_dir, mb, gray=False))
+    if args.mode == "dump_pairs_gray":
+        if not args.dump_dir:
+            raise SystemExit("[FATAL] --mode dump_pairs_gray requires --dump_dir")
+        results.append(run_dump_pairs(tr, args.dump_dir, mb, gray=True))
     if args.mode in ("all", "hist"):
         results.append(run_hist(tr, mb))
     if args.mode in ("all", "realval"):

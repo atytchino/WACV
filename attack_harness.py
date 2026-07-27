@@ -137,6 +137,37 @@ class Judge:
 
 
 # --------------------------------------------------------------------------- attacks
+class ConsistencyJudge:
+    """LEVEL 2: scores an image through the blind consistency detector.
+
+    Unlike the C2 Judge (which needs the gate-acc span originals->watermarked to
+    normalise), cons_det answers directly: it emits a logit whose sigmoid is
+    P(the watermark on this image is NATIVE to it). So forgery success here is
+    simply the fraction of forged images the detector ACCEPTS as native
+    (logit > 0) — no span normalisation, directly comparable across attacks.
+
+    Present only when the loaded system checkpoint carries a cons_det (a Level-2
+    system). For a pre-Level-2 or ablation (consistency_lam 0) checkpoint there is
+    no cons_det and this judge is absent — the harness then reports C2-only, which
+    is exactly what shows the ablation still forges ~99%.
+    """
+
+    def __init__(self, tr):
+        self.tr = tr
+        self.cons = getattr(tr, "cons_det", None)
+
+    @property
+    def available(self):
+        return self.cons is not None
+
+    @torch.no_grad()
+    def accept_rate(self, x01):
+        """Fraction of the batch the detector calls NATIVE (accepts). x01 in [0,1]."""
+        xN = (x01.clamp(0, 1) * 2 - 1)
+        logit = self.cons(xN).flatten()
+        return float((logit > 0).float().mean().item()), float(torch.sigmoid(logit).mean().item())
+
+
 def _forgery_rate(acc_orig, acc_attack, acc_wm):
     """Where the attack lands between originals (blocked) and genuine wm (passes)."""
     span = max(acc_wm - acc_orig, 1e-6)
@@ -172,6 +203,15 @@ def run(args):
         print(f"[DATA] subsampled to {len(pairs)} pairs (seed {args.seed})")
 
     judge = Judge(tr, class_to_idx)
+    cons_judge = ConsistencyJudge(tr)  # LEVEL 2: blind consistency detector (if present)
+    if cons_judge.available:
+        try:
+            tr.cons_det.eval()
+        except Exception:
+            pass
+        print("[LEVEL2] cons_det found in checkpoint — reporting blind consistency forgery too")
+    else:
+        print("[LEVEL2] no cons_det in this checkpoint — C2-only (pre-L2 or ablation system)")
 
     # -------- load everything we need once: orig01, wm01, label, class --------
     # (dumped images are small — 160px — so this fits comfortably.)
@@ -216,12 +256,30 @@ def run(args):
         n = len(imgs)
         return 100.0 * correct_total / n, wm_sum / n
 
+    def cons_stack(imgs):
+        """Fraction of imgs the blind cons_det ACCEPTS as native (forgery via consistency)."""
+        if not cons_judge.available:
+            return None
+        acc_n = 0
+        B = args.batch_size
+        for s in range(0, len(imgs), B):
+            xb = torch.cat(imgs[s:s + B], 0)
+            r, _ = cons_judge.accept_rate(xb)
+            acc_n += r * xb.shape[0]
+        return 100.0 * acc_n / len(imgs)
+
     # -------- baselines (sanity) --------
     print("\n[SCORING] originals and genuine watermarked (sanity) ...")
     acc_orig, wm_orig = judge_stack(origs, labels_t)
     acc_wm, wm_wm = judge_stack(wms, labels_t)
     print(f"  originals   gate-acc {acc_orig:6.2f}%   wm-score {wm_orig:+.3f}")
     print(f"  watermarked gate-acc {acc_wm:6.2f}%   wm-score {wm_wm:+.3f}")
+
+    cons_orig = cons_stack(origs)   # should be LOW (originals not native)
+    cons_wm = cons_stack(wms)       # should be HIGH (genuine watermarked = native)
+    if cons_judge.available:
+        print(f"  originals   cons-accept {cons_orig:6.2f}%  (expect low)")
+        print(f"  watermarked cons-accept {cons_wm:6.2f}%  (expect high)")
 
     results = {
         "dataset": data_root.name,
@@ -231,16 +289,25 @@ def run(args):
         "acc_watermarked": acc_wm,
         "wm_score_orig": wm_orig,
         "wm_score_wm": wm_wm,
+        "cons_available": bool(cons_judge.available),
+        "cons_accept_orig": cons_orig,
+        "cons_accept_wm": cons_wm,
         "attacks": {},
     }
 
     def record(name, imgs):
         acc, wm = judge_stack(imgs, labels_t)
         rate = _forgery_rate(acc_orig, acc, acc_wm)
-        results["attacks"][name] = {"gate_acc": acc, "wm_score": wm, "forgery_success": rate}
+        cons_rate = cons_stack(imgs)  # LEVEL 2: blind consistency forgery (accept rate)
+        entry = {"gate_acc": acc, "wm_score": wm, "forgery_success": rate}
         verdict = "BLOCKED" if rate < 20 else ("FORGED" if rate > 70 else "PARTIAL")
-        print(f"  {name:18s}  gate-acc {acc:6.2f}%   wm {wm:+.3f}   "
-              f"forgery {rate:6.2f}%   [{verdict}]")
+        line = (f"  {name:18s}  C2-forgery {rate:6.2f}% [{verdict}]")
+        if cons_rate is not None:
+            entry["forgery_via_cons"] = cons_rate
+            cons_verdict = "BLOCKED" if cons_rate < 20 else ("FORGED" if cons_rate > 70 else "PARTIAL")
+            line += f"   |   CONS-forgery {cons_rate:6.2f}% [{cons_verdict}]"
+        results["attacks"][name] = entry
+        print(line)
         return rate
 
     # -------- attacks --------
@@ -274,13 +341,31 @@ def run(args):
     record("universal", imgs)
 
     # -------- summary --------
-    print("\n" + "=" * 66)
+    print("\n" + "=" * 74)
     print(f"SUMMARY — {data_root.name}  (originals {acc_orig:.1f}% -> watermarked {acc_wm:.1f}%)")
-    print("=" * 66)
+    print("=" * 74)
+    _has_cons = cons_judge.available
+    hdr = f"  {'attack':18s}  {'C2-forgery':>12s}"
+    if _has_cons:
+        hdr += f"   {'CONS-forgery':>12s}"
+    print(hdr)
     for name, r in results["attacks"].items():
-        print(f"  {name:18s}  forgery success {r['forgery_success']:6.2f}%")
-    print("  (transplant/sign/scaled high = mark is transferable; "
-          "universal should be low)")
+        line = f"  {name:18s}  {r['forgery_success']:11.2f}%"
+        if _has_cons and "forgery_via_cons" in r:
+            line += f"   {r['forgery_via_cons']:11.2f}%"
+        print(line)
+    if _has_cons:
+        # headline: mean forgery over the real-δ attacks (exclude the universal control)
+        real_keys = [k for k in results["attacks"] if k != "universal"]
+        c2_mean = sum(results["attacks"][k]["forgery_success"] for k in real_keys) / max(1, len(real_keys))
+        cons_mean = sum(results["attacks"][k].get("forgery_via_cons", 0.0) for k in real_keys) / max(1, len(real_keys))
+        print("\n  BEFORE/AFTER headline (mean over real-δ attacks, universal excluded):")
+        print(f"    C2 (energy-keyed, the BEFORE detector):   {c2_mean:6.2f}% forgery")
+        print(f"    blind consistency (the LEVEL-2 detector): {cons_mean:6.2f}% forgery")
+        print(f"    => content-binding closes {c2_mean - cons_mean:.1f}pp of transplant forgery, blind.")
+    else:
+        print("  (transplant/sign/scaled high = mark is transferable; universal should be low)")
+        print("  (no cons_det in this checkpoint: this is the BEFORE / ablation number)")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)

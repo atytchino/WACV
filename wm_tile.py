@@ -58,10 +58,19 @@ def tile_message_map(signed_bits: torch.Tensor, H: int, W: int,
     gr, gc = grid
     assert gr * gc >= n_bits, f"grid {gr}x{gc} too small for {n_bits} bits"
 
-    # place bits into a [B, gr*gc] buffer (pad unused cells with 0 = no signal)
-    buf = signed_bits.new_zeros(B, gr * gc)
-    buf[:, :n_bits] = signed_bits
-    buf = buf.view(B, 1, gr, gc)  # [B,1,gr,gc]
+    # place bits into a [B, gr*gc] buffer.
+    # v17: if the grid has MORE cells than bits, TILE the bits cyclically to fill
+    # every cell (redundant spatial encoding) instead of zero-padding — this keeps
+    # the signal dense at fine grids and lets the reader average copies (lower BER).
+    ncells = gr * gc
+    if ncells == n_bits:
+        buf = signed_bits
+    elif ncells > n_bits:
+        reps = (ncells + n_bits - 1) // n_bits
+        buf = signed_bits.repeat(1, reps)[:, :ncells]   # cyclic fill
+    else:
+        buf = signed_bits[:, :ncells]                   # grid smaller than bits (unused here)
+    buf = buf.contiguous().view(B, 1, gr, gc)  # [B,1,gr,gc]
 
     # upsample to full resolution with NEAREST so each patch is a hard constant
     # (no interpolation blur across bit boundaries — structure preserved).
@@ -90,5 +99,18 @@ class TileMessageReader(nn.Module):
         gr, gc = self.grid
         # adaptive average pool to grid → [B,1,gr,gc]
         pooled = F.adaptive_avg_pool2d(residual_luma, output_size=(gr, gc))
-        flat = pooled.view(B, gr * gc)[:, :self.n_bits]  # [B,n_bits]
+        cells = pooled.view(B, gr * gc)                       # [B, gr*gc]
+        ncells = gr * gc
+        if ncells == self.n_bits:
+            flat = cells
+        elif ncells > self.n_bits:
+            # v17: bits were tiled cyclically to fill the grid → AVERAGE all copies
+            # of each bit back into n_bits logits (redundancy → lower BER).
+            reps = (ncells + self.n_bits - 1) // self.n_bits
+            pad = reps * self.n_bits - ncells
+            if pad > 0:
+                cells = F.pad(cells, (0, pad))                # pad to a whole number of reps
+            flat = cells.view(B, reps, self.n_bits).mean(dim=1)  # average copies
+        else:
+            flat = cells[:, :self.n_bits]
         return flat * self.logit_scale
